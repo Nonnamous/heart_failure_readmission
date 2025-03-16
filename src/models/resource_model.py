@@ -13,121 +13,12 @@ from sklearn.metrics import (
     mean_squared_error, mean_absolute_error, r2_score, 
     mean_absolute_percentage_error
 )
-from sklearn.model_selection import RandomizedSearchCV, cross_val_score
+from sklearn.model_selection import RandomizedSearchCV, cross_val_score, train_test_split
 from lightgbm import LGBMRegressor
 import time
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 from src.utils.feature_name_cleaner import clean_feature_names
-
-def calculate_length_of_stay(processed_dir):
-    """Calculate length of stay metrics using actual ICU data from MIMIC-IV"""
-    # Define paths
-    base_dir = os.path.dirname(os.path.dirname(processed_dir))
-    raw_dir = os.path.join(base_dir, 'raw')
-    
-    # Load the processed dataset
-    data_file = os.path.join(processed_dir, 'hf_data_processed.csv')
-    data = pd.read_csv(data_file)
-    
-    # Load ICU stays data
-    icustays_file = os.path.join(base_dir, 'raw', 'icustays.csv')
-    if not os.path.exists(icustays_file):
-        print(f"WARNING: ICU stays file not found at {icustays_file}")
-        print(f"Current working directory: {os.getcwd()}")
-        print(f"Checking absolute path: {os.path.abspath(icustays_file)}")
-    
-    print(f"Loading ICU stays data from {icustays_file}")
-    icustays = pd.read_csv(icustays_file)
-    # Calculate ICU stay duration in days
-    if 'intime' in icustays.columns and 'outtime' in icustays.columns:
-        icustays['intime'] = pd.to_datetime(icustays['intime'])
-        icustays['outtime'] = pd.to_datetime(icustays['outtime'])
-        icustays['los_days'] = (icustays['outtime'] - icustays['intime']).dt.total_seconds() / (24 * 60 * 60)
-    else:
-        # If los column already exists in days, just copy it
-        icustays['los_days'] = icustays['los']
-
-    # Merge ICU stays with patient data
-    print("Merging ICU data with patient records...")
-    if 'hadm_id' in data.columns and 'hadm_id' in icustays.columns:
-        # Group ICU stays by hospital admission to handle multiple ICU stays
-        icu_los_by_admission = icustays.groupby('hadm_id')['los'].sum().reset_index()
-        icu_los_by_admission.rename(columns={'los': 'icu_los_days'}, inplace=True)
-        
-        # Merge with main dataset
-        data = pd.merge(data, icu_los_by_admission, on='hadm_id', how='left')
-        
-        # Fill missing ICU LOS with 0 (no ICU stay)
-        data['icu_los_days'] = data['icu_los_days'].fillna(0)
-        
-        # Calculate ratio of ICU to total stay
-        data['icu_ratio'] = data['icu_los_days'] / data['total_los_days']
-        
-        # Handle any division by zero or NaN
-        data['icu_ratio'] = data['icu_ratio'].fillna(0).clip(0, 1)
-        
-        # Report statistics
-        print(f"Patients with ICU stays: {(data['icu_los_days'] > 0).sum()}/{len(data)} " + 
-              f"({(data['icu_los_days'] > 0).sum()/len(data):.1%})")
-        print(f"Average ICU LOS for ICU patients: {data[data['icu_los_days'] > 0]['icu_los_days'].mean():.2f} days")
-        print(f"Average total LOS: {data['total_los_days'].mean():.2f} days")
-        print(f"Average ICU ratio: {data['icu_ratio'].mean():.2%}")
-    else:
-        print("ERROR: hadm_id not found in datasets. Cannot match ICU stays.")
-
-    
-    # Scale the values
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    data['icu_ratio'] = scaler.fit_transform(data['icu_ratio'].values.reshape(-1, 1))
-    # Also scale the total LOS days
-    data['total_los_days'] = scaler.fit_transform(data['total_los_days'].values.reshape(-1, 1))
-    
-    # Save the updated dataset
-    data.to_csv(os.path.join(processed_dir, 'hf_data_processed_with_los.csv'), index=False)
-
-    # Save the updated dataset
-    data.to_csv(os.path.join(processed_dir, 'hf_data_processed_with_los.csv'), index=False)
-    
-    # Now create train/test splits for these targets
-    # We need to match the existing train/test split
-    X_train = pd.read_csv(os.path.join(processed_dir, 'X_train.csv'))
-    X_test = pd.read_csv(os.path.join(processed_dir, 'X_test.csv'))
-    
-    if 'hadm_id' in X_train.columns:
-        train_hadm_ids = set(X_train['hadm_id'])
-        test_hadm_ids = set(X_test['hadm_id'])
-        
-        # Filter the data for train and test sets
-        train_los = data[data['hadm_id'].isin(train_hadm_ids)]
-        test_los = data[data['hadm_id'].isin(test_hadm_ids)]
-    else:
-        # If hadm_id not in features, use row indices based on proportions
-        train_size = len(X_train)
-        test_size = len(X_test)
-        
-        # Check if we need to sample or can use direct indexing
-        if len(data) == train_size + test_size:
-            train_los = data.iloc[:train_size]
-            test_los = data.iloc[train_size:]
-        else:
-            # Randomly sample rows to match sizes
-            np.random.seed(42)
-            train_indices = np.random.choice(len(data), train_size, replace=False)
-            remaining_indices = np.setdiff1d(np.arange(len(data)), train_indices)
-            test_indices = np.random.choice(remaining_indices, test_size, replace=False)
-            
-            train_los = data.iloc[train_indices]
-            test_los = data.iloc[test_indices]
-    
-    # Save the train/test splits for each target
-    for target in ['icu_los_days', 'icu_ratio']:
-        train_los[target].to_csv(os.path.join(processed_dir, f'{target}_train.csv'), index=False)
-        test_los[target].to_csv(os.path.join(processed_dir, f'{target}_test.csv'), index=False)
-    
-    print("Length of stay metrics calculated and saved using actual ICU data")
-    return data
 
 def load_data(processed_dir, include_readmission_pred=True):
     """
@@ -146,83 +37,39 @@ def load_data(processed_dir, include_readmission_pred=True):
     """
     print(f"Loading data from {processed_dir}")
     
-    # Define target variables for resource prediction
-    resource_targets = ['total_los_days', 'icu_ratio']
-    
-    # Check if resource target files exist
-    target_files_exist = all(
-        os.path.exists(os.path.join(processed_dir, f'{target}_train.csv')) 
-        for target in resource_targets
+    target_col = 'icu_los_days'
+
+    # Load the data from hf_data_processed.csv
+    data_path = os.path.join(processed_dir, 'hf_data_processed.csv')
+    data = pd.read_csv(data_path)
+
+    # Split into features and target
+    X = data.drop(columns=[target_col])
+    y = data[target_col]
+
+    # Split into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
     )
-    
-    # Load or calculate the full dataset with LOS values
-    if not target_files_exist:
-        print("Resource target files not found, calculating length of stay metrics...")
-        full_data = calculate_length_of_stay(processed_dir)
-    else:
-        # Load the data with LOS metrics if it exists
-        los_file = os.path.join(processed_dir, 'hf_data_processed_with_los.csv')
-        if os.path.exists(los_file):
-            full_data = pd.read_csv(los_file)
-        else:
-            # Fall back to original processed data
-            full_data = pd.read_csv(os.path.join(processed_dir, 'hf_data_processed.csv'))
-    
-    # Now check which targets are available in the full data
-    available_targets = [target for target in resource_targets if target in full_data.columns]
-    
-    if not available_targets:
-        raise ValueError(f"No resource target columns found in the dataset")
-    
-    print(f"Available resource targets: {available_targets}")
-    target_col = available_targets[0]  # Use the first available target
-    
-    # Load train/test split for features
-    X_train = pd.read_csv(os.path.join(processed_dir, 'X_train.csv'))
-    X_test = pd.read_csv(os.path.join(processed_dir, 'X_test.csv'))
-    
-    # Find the corresponding rows in full_data for train and test sets
-    # This is tricky and depends on how your data is structured
-    # Option 1: If hadm_id is available in both datasets
-    if 'hadm_id' in X_train.columns and 'hadm_id' in full_data.columns:
-        # Use hadm_id to match rows
-        train_hadm_ids = set(X_train['hadm_id'])
-        test_hadm_ids = set(X_test['hadm_id'])
-        
-        # Extract target values by matching hadm_ids
-        y_train = full_data[full_data['hadm_id'].isin(train_hadm_ids)][target_col].values
-        y_test = full_data[full_data['hadm_id'].isin(test_hadm_ids)][target_col].values
-        
-        # Check if we got the right number of samples
-        if len(y_train) != len(X_train) or len(y_test) != len(X_test):
-            print(f"WARNING: Number of samples in target ({len(y_train)}, {len(y_test)}) " + 
-                  f"doesn't match features ({len(X_train)}, {len(X_test)})")
-            
-            # Try loading directly from files instead
-            try:
-                y_train = pd.read_csv(os.path.join(processed_dir, f'{target_col}_train.csv')).values.ravel()
-                y_test = pd.read_csv(os.path.join(processed_dir, f'{target_col}_test.csv')).values.ravel()
-                print("Loaded target values from CSV files instead")
-            except Exception as e:
-                print(f"Error loading target CSV files: {e}")
-                raise ValueError("Cannot match feature and target samples")
-    else:
-        # Option 2: Try using the target CSV files directly
-        try:
-            y_train = pd.read_csv(os.path.join(processed_dir, f'{target_col}_train.csv')).values.ravel()
-            y_test = pd.read_csv(os.path.join(processed_dir, f'{target_col}_test.csv')).values.ravel()
-        except Exception as e:
-            print(f"Error loading target CSV files: {e}")
-            
-            # Option 3: Last resort - assume samples are in the same order
-            if len(full_data) >= len(X_train) + len(X_test):
-                print("WARNING: Using order-based matching between features and targets")
-                # Assume first n rows are train, next m rows are test
-                y_train = full_data[target_col].values[:len(X_train)]
-                y_test = full_data[target_col].values[len(X_train):len(X_train)+len(X_test)]
-            else:
-                raise ValueError("Cannot determine how to match features and targets")
-    
+
+    print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+    print(f"X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
+
+    # Drop ID column as it should not be used as a feature
+    print("Dropping hadm_id column from features...")
+    X_train = X_train.drop(columns=['hadm_id'], errors='ignore')
+    X_test = X_test.drop(columns=['hadm_id'], errors='ignore')
+
+    # Drop total_los_days if present (too closely related to target)
+    if 'total_los_days' in X_train.columns:
+        print("Dropping total_los_days column from features...")
+        X_train = X_train.drop(columns=['total_los_days'])
+        X_test = X_test.drop(columns=['total_los_days'])
+
+    # Convert y to a 1D array
+    y_train = y_train.values
+    y_test = y_test.values
+
     # Include readmission predictions if requested
     if include_readmission_pred:
         # Load the best readmission model
@@ -257,67 +104,13 @@ def load_data(processed_dir, include_readmission_pred=True):
             print(f"Error loading readmission model: {e}")
             print("Proceeding without readmission predictions.")
     
+
+
     print(f"Loaded {X_train.shape[0]} training samples and {X_test.shape[0]} testing samples")
     print(f"Number of features: {X_train.shape[1]}")
     print(f"Target variable: {target_col} (mean value in training: {np.mean(y_train):.2f})")
-    
-    return X_train, X_test, y_train, y_test, X_train.columns.tolist(), target_col
 
-def preprocess_features(X_train, X_test):
-    """
-    Handle categorical features by one-hot encoding them.
-    
-    Parameters:
-    -----------
-    X_train : DataFrame
-        Training features
-    X_test : DataFrame
-        Testing features
-        
-    Returns:
-    --------
-    X_train_processed, X_test_processed
-    """
-    from sklearn.preprocessing import OneHotEncoder
-    
-    # Identify string columns
-    string_cols = X_train.select_dtypes(include=['object']).columns.tolist()
-    
-    if not string_cols:
-        print("No categorical columns found, returning original data")
-        return X_train, X_test
-    
-    print(f"Found {len(string_cols)} categorical columns to encode")
-    
-    # Keep track of non-string columns
-    non_string_cols = [col for col in X_train.columns if col not in string_cols]
-    
-    # Initialize encoder with parameters compatible with older scikit-learn versions
-    try:
-        # Try newer scikit-learn parameter
-        encoder = OneHotEncoder(sparse_output=False, drop='first', handle_unknown='ignore')
-    except TypeError:
-        # Fallback for older scikit-learn versions
-        encoder = OneHotEncoder(sparse=False, drop='first', handle_unknown='ignore')
-    
-    # Fit and transform training data
-    encoded_train = encoder.fit_transform(X_train[string_cols])
-    encoded_test = encoder.transform(X_test[string_cols])
-    
-    # Get the feature names
-    feature_names = encoder.get_feature_names_out(string_cols)
-    
-    # Create new DataFrames with encoded features
-    encoded_train_df = pd.DataFrame(encoded_train, columns=feature_names, index=X_train.index)
-    encoded_test_df = pd.DataFrame(encoded_test, columns=feature_names, index=X_test.index)
-    
-    # Combine with non-string columns
-    X_train_processed = pd.concat([X_train[non_string_cols], encoded_train_df], axis=1)
-    X_test_processed = pd.concat([X_test[non_string_cols], encoded_test_df], axis=1)
-    
-    print(f"Data shape after encoding: {X_train_processed.shape}")
-    
-    return X_train_processed, X_test_processed
+    return X_train, X_test, y_train, y_test, X_train.columns.tolist(), target_col
 
 def train_linear_regression(X_train, y_train):
     """
@@ -1095,16 +888,19 @@ def main(data_dir="data", output_dir="models", save_plots=True, use_cross_valida
     processed_dir = os.path.join(data_dir, 'processed')
     models_dir = os.path.join(data_dir, '..', 'models')
     plots_dir = os.path.join(data_dir, '..', 'reports', 'figures')
+    raw_dir = os.path.join(data_dir, 'raw')
     
     # Create directories if they don't exist
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
     
+    #Test
+    # Print raw_dir
+    print("raw dir is: ", raw_dir)
+    print("processed dir is: ", processed_dir)
+
     # Load data
     X_train, X_test, y_train, y_test, feature_names, target_col = load_data(processed_dir)
-    
-    # Add preprocessing step for categorical features
-    X_train, X_test = preprocess_features(X_train, X_test)
     
     feature_names = X_train.columns.tolist()
 

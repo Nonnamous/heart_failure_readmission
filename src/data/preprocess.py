@@ -3,7 +3,7 @@
 import pandas as pd
 import numpy as np
 import os
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 
@@ -56,6 +56,66 @@ def ensure_correct_paths(data_dir):
     print(f"Files in raw directory: {raw_files}")
     
     return base_dir, raw_dir, interim_dir, processed_dir
+
+def calculate_los(df, data_dir):
+    """
+    Calculate the length of stay in days for each admission
+    
+    Parameters:
+    -----------
+    data_dir : str
+        Directory containing MIMIC-IV files
+        
+    Returns:
+    --------
+    DataFrame
+        DataFrame with length of stay in days for each admission
+    """
+    # Get the correct paths
+    base_dir, raw_dir, interim_dir, processed_dir = ensure_correct_paths(data_dir)
+    
+    def calculate_stay_duration(df, start_col, end_col, duration_col):
+        """Helper function to calculate length of stay"""
+        df[start_col] = pd.to_datetime(df[start_col])
+        df[end_col] = pd.to_datetime(df[end_col])
+        df[duration_col] = (df[end_col] - df[start_col]).dt.total_seconds() / (24 * 3600)
+        df[duration_col] = df[duration_col].clip(lower=0)
+        return df
+    
+    # Load and process admissions data
+    admissions = pd.read_csv(os.path.join(raw_dir, 'admissions.csv'))
+    admissions = calculate_stay_duration(
+        admissions, 
+        'admittime', 
+        'dischtime', 
+        'total_los_days'
+    )
+    
+    # Load and process ICU stays data
+    icustays = pd.read_csv(os.path.join(raw_dir, 'icustays.csv'))
+    icustays = calculate_stay_duration(
+        icustays,
+        'intime',
+        'outtime',
+        'icu_los_days'
+    )
+    
+    # NOTE: it may be better to calculate total los using edregtime as the start if it precedes admittime
+
+    # Merge admissions and ICU stays
+    merged_data = pd.merge(admissions, icustays, on='hadm_id', how='left')
+
+    # Calculate ICU length of stay ratio to total length of stay
+    merged_data['icu_los_ratio'] = merged_data['icu_los_days'] / merged_data['total_los_days']
+    
+    # Fill missing values with 0
+    merged_data['icu_los_ratio'] = merged_data['icu_los_ratio'].fillna(0)
+    merged_data['icu_los_days'] = merged_data['icu_los_days'].fillna(0)
+
+    # add merged data to full dataframe
+    df = pd.merge(df, merged_data[['hadm_id', 'total_los_days', 'icu_los_days', 'icu_los_ratio']], on='hadm_id', how='left')
+
+    return df 
 
 def create_final_dataset(data_dir):
     """
@@ -126,7 +186,7 @@ def create_final_dataset(data_dir):
     
     return merged_data
 
-def handle_missing_values(df, numerical_cols, id_cols, target_col, exclude_cols):
+def handle_missing_values(df, id_cols, target_col, exclude_cols):
     """
     Handle missing values in the dataset by dropping rows with missing values
     only in critical columns and imputing other values where appropriate
@@ -157,26 +217,15 @@ def handle_missing_values(df, numerical_cols, id_cols, target_col, exclude_cols)
         print(f"Initial target distribution: {target_counts}")
         print(f"Initial positive rate: {target_counts.get(True, 0) / len(df_cleaned):.2%}")
     
-    # Identify critical columns (those that will be used in modeling)
-    modeling_cols = [col for col in df_cleaned.columns 
-                    if col not in exclude_cols + id_cols
-                    and col != target_col]
-    
-    # Check missing values in each column
-    missing_counts = df_cleaned[modeling_cols].isnull().sum()
-    print("\nMissing values by column before handling:")
-    for col, count in missing_counts.items():
-        if count > 0:
-            print(f"  {col}: {count} ({count/len(df_cleaned):.2%})")
-    
-    # Critical numerical columns to use for dropping
+    # NOTE: Future version may automatically determine which columns to drop from or use exclude_cols
+    # Critical columns to use for dropping
     critical_cols = [
         'anchor_age', 'gender', 'marital_status', 'insurance', 'language',
         'hypertension', 'diabetes', 'kidney_disease', 'copd', 'coronary_artery_disease', 'obesity', 'anemia',
     ]
     
     # Only drop rows with missing values in critical columns
-    critical_cols = critical_cols + [target_col]
+    critical_cols = critical_cols + [target_col] + id_cols
     rows_before = len(df_cleaned)
     df_cleaned = df_cleaned.dropna(subset=critical_cols)
     dropped_rows = rows_before - len(df_cleaned)
@@ -184,17 +233,17 @@ def handle_missing_values(df, numerical_cols, id_cols, target_col, exclude_cols)
     print(f"Remaining rows: {len(df_cleaned)}")
     
     # Check remaining missing values
-    missing_after = df_cleaned[modeling_cols].isnull().sum().sum()
+    missing_after = df_cleaned[critical_cols].isnull().sum().sum()
     if missing_after == 0:
-        print("\nNo missing values remain in modeling columns")
+        print("\nNo missing values remain in critical columns")
     else:
-        print(f"\nWarning: {missing_after} missing values remain in modeling columns")
+        print(f"\nWarning: {missing_after} missing values remain in critical columns")
     
     return df_cleaned
 
-def normalize_numerical_features(df, numerical_cols):
+def normalize_numerical_features(df, numerical_cols, scaler=MinMaxScaler([0,1])):
     """
-    Normalize numerical features using StandardScaler
+    Normalize numerical features using MinMaxScaler
     
     Parameters:
     -----------
@@ -214,9 +263,11 @@ def normalize_numerical_features(df, numerical_cols):
     existing_numerical_cols = [col for col in numerical_cols if col in df.columns]
     
     if existing_numerical_cols:
-        scaler = StandardScaler()
+        scaler = MinMaxScaler()
         df_normalized[existing_numerical_cols] = scaler.fit_transform(df[existing_numerical_cols])
     
+    df_normalized = truncate_numerical(df_normalized)
+
     return df_normalized
 
 def encode_categorical_features(df, categorical_cols):
@@ -259,7 +310,111 @@ def encode_categorical_features(df, categorical_cols):
     
     return df_encoded, None
 
-def prepare_data_for_modeling(df, target_col='is_readmission', test_size=0.2, random_state=42):
+def create_binary_columns(df, exclude_cols):
+    """
+    Create binary indicators for multiple categorical columns
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        Input DataFrame
+    exclude_cols : list
+        List of columns to exclude
+        
+    Returns:
+    --------
+    df : DataFrame
+        DataFrame with new binary indicators
+    exclude_cols : list 
+        Updated exclude columns
+    """
+    # Define the mappings for binary columns
+    binary_mappings = [
+        ('language', 'ENGLISH', 'english_lang'),
+        ('marital_status', 'MARRIED', 'is_married'),
+        ('insurance', 'MEDICARE', 'insurance_Medicare'),
+    ]
+    
+    for column_name, target_value, new_column_name in binary_mappings:
+        if column_name in df.columns:
+            df[new_column_name] = (df[column_name].str.upper() == target_value.upper()).astype(int)
+            # Add original column to exclude cols if not already present
+            if column_name not in exclude_cols:
+                exclude_cols.append(column_name)
+    
+    return df, exclude_cols
+
+def standardize_race(df):
+    """
+    Standardize race column by first word and applying manual overrides
+    More research should be done on data and race categories to ensure accuracy
+
+    Parameters:
+    -----------
+    df : DataFrame
+        Input DataFrame
+
+    Returns:
+    --------
+    DataFrame
+        DataFrame with standardized race column
+    """
+    # Standardize race categories by first word
+    if 'race' in df.columns:
+        df_standard = df.copy()
+        df_standard['race'] = df_standard['race'].fillna('Unknown')
+        df_standard['race_standardized'] = df_standard['race'].apply(lambda x: x.split(' ')[0].split('/')[0].title())
+        
+        # Create mapping for any manual overrides
+        # note: this is a few examples and may not cover all cases
+        race_mapping = {
+            'Hispanic': 'Latino',    # Map Hispanic to Latino
+            'Portuguese': 'Latino',  # Map Portuguese to Latino
+            'American': 'Native_American',  # Map American to Native_American
+            'Native': 'Pacific_Islander',   # Map Native to Pacific_Islander
+            'Patient': 'Unknown',    # Map Patient to Unknown
+            'Unable': 'Unknown',     # Map Unable to Unknown
+            # Mappings that should be reviewed:
+            # 'WHITE - BRAZILIAN' is currently mapped to WHITE
+            # 'PORTUGUESE' was assumed to mean Brazilian and mapped to LATINO
+            # 'ASIAN - ASIAN INDIAN' is included in ASIAN
+            # 'OTHER' and 'MULTIPLE' were left as-is
+        }
+        
+        # Apply manual overrides while keeping other first-word mappings
+        df['race'] = df_standard['race_standardized'].map(lambda x: race_mapping.get(x, x))
+
+    return df
+
+def truncate_numerical(df):
+    """
+    Preprocess features to handle extreme values, infinities, and NaNs
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        
+    Returns:
+    --------
+    df : DataFrame
+        DataFrame with truncated numerical features
+    """
+    # Make copies to avoid modifying the original data
+    df_copy = df.copy()
+    
+    # Get numerical features
+    numeric_features = df_copy.select_dtypes(include=['int64', 'float64']).columns
+    
+    print(f"Processing {len(numeric_features)} numerical features")
+    
+    # Process each numerical column
+    for col in numeric_features:
+        # Round to 5 decimal places
+        df_copy[col] = df_copy[col].round(decimals=5)
+    
+    return df_copy
+
+def prepare_data_for_modeling(df, id_cols, target_col='is_readmission', test_size=0.2, random_state=42):
     """
     Prepare data for modeling by splitting into features and target,
     and then into training and testing sets
@@ -322,9 +477,10 @@ def main(data_dir):
     target_col = 'is_readmission'
     
     # Define numerical columns explicitly
-    numerical_cols = ['anchor_age', 'total_los_days', 'icu_los_days', 'non_icu_los_days',
-                     'sodium_mean', 'potassium_mean', 'bnp_mean', 'creatinine_mean', 
-                     'hgb_mean', 'troponin_mean']
+    numerical_cols = ['anchor_age', 'total_los_days', #'icu_los_days',
+                      ]
+    categorical_cols = ['gender', 'race',
+                        ]
     
     # Exclude columns that won't be used in modeling
     exclude_cols = [
@@ -332,94 +488,21 @@ def main(data_dir):
         'admission_type', 'admission_location', 'discharge_location', 
         'edregtime', 'edouttime', 'hospital_expire_flag'
     ]
-    
-    # Dynamically identify categorical columns
-    categorical_cols = [
-        col for col in final_data.columns 
-        if col not in numerical_cols + id_cols + [target_col] + exclude_cols
-        and final_data[col].dtype == 'object'
-    ]
-    print(f"Identified categorical columns: {categorical_cols}")
 
     # Handle missing values
-    data_imputed = handle_missing_values(final_data, numerical_cols, id_cols, target_col, exclude_cols)
+    data_imputed = handle_missing_values(final_data, id_cols, target_col, exclude_cols)
 
-    # Convert string timestamps to datetime objects
-    data_imputed['admittime'] = pd.to_datetime(data_imputed['admittime'])
-    data_imputed['dischtime'] = pd.to_datetime(data_imputed['dischtime'])
+    # Calculate length of stay
+    data_imputed = calculate_los(data_imputed, data_dir)
+
+    # Create binary indicators for language and marital status
+    data_imputed, exclude_cols = create_binary_columns(data_imputed, exclude_cols)
     
-    # Calculate total length of stay in days
-    data_imputed['total_los_days'] = (data_imputed['dischtime'] - data_imputed['admittime']).dt.total_seconds() / (24 * 3600)
-    
-    # Handle any negative values or other anomalies (data errors)
-    data_imputed['total_los_days'] = data_imputed['total_los_days'].clip(lower=0)
-
-    # Add total_los_days to numerical columns
-    numerical_cols.append('total_los_days')
-
-    # Remove admission and discharge times after calculating total length of stay
-    data_imputed = data_imputed.drop(columns=['admittime', 'dischtime'])
-
-    # Create binary language column
-    if 'language' in data_imputed.columns:
-        data_imputed['english_lang'] = (data_imputed['language'].str.upper() == 'ENGLISH').astype(int)
-        # Remove original language column from categorical columns if present
-        if 'language' in categorical_cols:
-            categorical_cols.remove('language')
-        # Add language to exclude cols
-        exclude_cols.append('language')
-
-    # Create binary marital status column
-    if 'marital_status' in data_imputed.columns:
-        data_imputed['is_married'] = (data_imputed['marital_status'] == 'MARRIED').astype(int)
-        # Drop original marital_status column if it's in categorical_cols
-        if 'marital_status' in categorical_cols:
-            categorical_cols.remove('marital_status')
-        # Add marital_status to exclude_cols
-        exclude_cols.append('marital_status')
-    
-    # Standardize race categories and create binary indicators
-    if 'race' in data_imputed.columns:
-        # Create mapping for race standardization
-        # Extract first word before any spaces or / to use as standardized race
-        df_cleaned = data_imputed.copy()
-        df_cleaned['race'] = df_cleaned['race'].fillna('Unknown')
-        df_cleaned['race_standardized'] = df_cleaned['race'].apply(lambda x: x.split(' ')[0].split('/')[0].title())
-        
-        # Create mapping for any manual overrides
-        # note: this is a few examples and may not cover all cases
-        race_mapping = {
-            'PORTUGUESE': 'Latino',  # Map Portuguese to Latino
-            'Hispanic': 'Latino',    # Map Hispanic to Latino
-            'Unknown': 'Other',      # Map Unknown to Other
-        }
-        
-        # Apply manual overrides while keeping other first-word mappings
-        data_imputed['race_standardized'] = df_cleaned['race_standardized'].map(lambda x: race_mapping.get(x, x))
-        
-        # Create binary indicators for major race categories
-        major_races = ['White', 'Black', 'Asian', 'Latino']
-        for race in major_races:
-            data_imputed[f'Is_{race}'] = (data_imputed['race_standardized'] == race).astype(int)
-        
-        # Drop original race column if it's in categorical columns
-        if 'race' in categorical_cols:
-            categorical_cols.remove('race')
-        
-        # Add race and race_standardized to exclude_cols
-        exclude_cols.extend(['race', 'race_standardized'])
-
-    print(f"Available columns in dataframe: {data_imputed.columns.tolist()}")
-
-    # Update your numerical_cols definition in main():
-    available_cols = final_data.columns.tolist()
-    print(f"Available numerical columns: {[col for col in numerical_cols if col in available_cols]}")
-
-    # Or alternatively, define numerical columns based on what's actually available:
-    numerical_cols = [col for col in numerical_cols if col in final_data.columns]
+    # Standardize race column
+    data_imputed = standardize_race(data_imputed)
 
     # Normalize numerical features
-    data_normalized = normalize_numerical_features(data_imputed, numerical_cols)
+    data_normalized = normalize_numerical_features(data_imputed, numerical_cols, scaler=MinMaxScaler([0,1]))
     
     # Encode categorical features
     data_processed, encoder = encode_categorical_features(data_normalized, categorical_cols)
@@ -431,28 +514,17 @@ def main(data_dir):
     if 'anchor_age' in data_processed.columns:
         data_processed = data_processed.rename(columns={'anchor_age': 'age'})
     
-    # Drop insurance_Other if it exists in the dataframe
-    # This is a duplicate column of insurance_Medicare
-    if 'insurance_Other' in data_processed.columns:
-        data_processed = data_processed.drop(columns=['insurance_Other'])
-    
     # Remove ID columns after all processing
-    data_processed = data_processed.drop(columns=id_cols)
-    
-    # Remove total_los_days if it exists in the dataframe and create a separate file for it
-    if 'total_los_days' in data_processed.columns:
-        total_los_days = data_processed['total_los_days']
-        data_processed = data_processed.drop(columns=['total_los_days'])
-        total_los_days.to_csv(os.path.join(processed_dir, 'total_los_days.csv'), index=False)
+    # Trying only with subject_id for now
+    data_processed = data_processed.drop(columns='subject_id')
 
     # Prepare data for modeling
-    X_train, X_test, y_train, y_test = prepare_data_for_modeling(data_processed, target_col)
-    
-    # Define feature columns (all columns except target)
-    feature_cols = [col for col in data_processed.columns if col != target_col]
-    
-    # filter out excluded columns
-    feature_cols = [col for col in feature_cols if col not in exclude_cols]
+    X_train, X_test, y_train, y_test = prepare_data_for_modeling(data_processed, id_cols, target_col)
+
+    # NOTE: Drop icu_los_ratio for now due to potential data leakage
+    data_processed = data_processed.drop(columns='icu_los_ratio')
+    X_train = X_train.drop(columns='icu_los_ratio')
+    X_test = X_test.drop(columns='icu_los_ratio')
 
     # Save full processed dataset
     data_processed.to_csv(os.path.join(processed_dir, 'hf_data_processed.csv'), index=False)

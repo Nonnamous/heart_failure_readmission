@@ -44,75 +44,20 @@ def load_data(processed_dir):
     y_train = pd.read_csv(os.path.join(processed_dir, 'y_train.csv')).values.ravel()
     y_test = pd.read_csv(os.path.join(processed_dir, 'y_test.csv')).values.ravel()
     
+    # Drop hadm_id column
+    X_train = X_train.drop('hadm_id', axis=1)
+    X_test = X_test.drop('hadm_id', axis=1)
+
+    # Drop los columns due to correlation
+    los_cols = [col for col in X_train.columns if 'los' in col]
+    X_train = X_train.drop(los_cols, axis=1)
+    X_test = X_test.drop(los_cols, axis=1)
+
     print(f"Loaded {X_train.shape[0]} training samples and {X_test.shape[0]} testing samples")
     print(f"Number of features: {X_train.shape[1]}")
     print(f"Positive class (readmissions) in training: {sum(y_train)}/{len(y_train)} ({sum(y_train)/len(y_train):.1%})")
     
     return X_train, X_test, y_train, y_test
-
-def preprocess_features(X_train, X_test):
-    """
-    Handle categorical features by one-hot encoding them.
-    
-    Parameters:
-    -----------
-    X_train : DataFrame
-        Training features
-    X_test : DataFrame
-        Testing features
-        
-    Returns:
-    --------
-    X_train_processed, X_test_processed
-    """
-    # First, remove days_until_readmission to prevent target leakage
-    if 'days_until_readmission' in X_train.columns:
-        print("Removing 'days_until_readmission' to avoid target leakage in readmission prediction")
-        X_train = X_train.drop('days_until_readmission', axis=1)
-    
-    if 'days_until_readmission' in X_test.columns:
-        X_test = X_test.drop('days_until_readmission', axis=1)
-    
-    from sklearn.preprocessing import OneHotEncoder
-    
-    # Identify string columns
-    string_cols = X_train.select_dtypes(include=['object']).columns.tolist()
-    
-    if not string_cols:
-        print("No categorical columns found, returning original data")
-        return X_train, X_test
-    
-    print(f"Found {len(string_cols)} categorical columns to encode")
-    
-    # Keep track of non-string columns
-    non_string_cols = [col for col in X_train.columns if col not in string_cols]
-    
-    # Initialize encoder with parameters compatible with older scikit-learn versions
-    try:
-        # Try newer scikit-learn parameter
-        encoder = OneHotEncoder(sparse_output=False, drop='first', handle_unknown='ignore')
-    except TypeError:
-        # Fallback for older scikit-learn versions
-        encoder = OneHotEncoder(sparse=False, drop='first', handle_unknown='ignore')
-    
-    # Fit and transform training data
-    encoded_train = encoder.fit_transform(X_train[string_cols])
-    encoded_test = encoder.transform(X_test[string_cols])
-    
-    # Get the feature names
-    feature_names = encoder.get_feature_names_out(string_cols)
-    
-    # Create new DataFrames with encoded features
-    encoded_train_df = pd.DataFrame(encoded_train, columns=feature_names, index=X_train.index)
-    encoded_test_df = pd.DataFrame(encoded_test, columns=feature_names, index=X_test.index)
-    
-    # Combine with non-string columns
-    X_train_processed = pd.concat([X_train[non_string_cols], encoded_train_df], axis=1)
-    X_test_processed = pd.concat([X_test[non_string_cols], encoded_test_df], axis=1)
-    
-    print(f"Data shape after encoding: {X_train_processed.shape}")
-    
-    return X_train_processed, X_test_processed
 
 def select_features(X_train, y_train, X_test, method='l1', threshold='median', max_features=None):
     """
@@ -754,10 +699,6 @@ def main(data_dir="data", tune_models=False, use_feature_selection=False):
     
     # Load data
     X_train, X_test, y_train, y_test = load_data(processed_dir)
-    feature_names = X_train.columns.tolist()
-    
-    # Add preprocessing step for categorical features
-    X_train, X_test = preprocess_features(X_train, X_test)
     
     feature_names = X_train.columns.tolist()
 
